@@ -1,12 +1,14 @@
-agent {
-  #定义使用 Kubernetes 作为 agent
-  kubernetes {
-    # 选择的云为之前配置的名字
-    cloud 'kubernetes-study'
-    slaveConnectTimeout 1200
-    # 将 workspace 改成 hostPath，因为该 Slave 会固定节点创建，如果有存储可用，可以改成 PVC 的模式
-    workspaceVolume hostPathWorkspaceVolume(hostPath: "/opt/workspace", readOnly: false)
-    yaml '''
+pipeline {
+
+  agent {
+      # 定义使用 Kubernetes 作为 agent
+      kubernetes {
+      # 选择的云为之前配置的名字
+        cloud 'kubernetes-study'
+        slaveConnectTimeout 1200
+      # 将 workspace 改成 hostPath，因为该 Slave 会固定节点创建，如果有存储可用，可以改成 PVC 的模式
+        workspaceVolume hostPathWorkspaceVolume(hostPath: "/opt/workspace", readOnly: false)
+        yaml '''
 apiVersion: v1
 kind: Pod
 spec:
@@ -100,82 +102,62 @@ spec:
     hostPath:
       path: "/opt/m2"
 '''
-  }
-}
+    }
+ }
 
-# 定义一些全局的环境变量
-environment {
- COMMIT_ID = ""
- HARBOR_ADDRESS = "CHANGE_HERE_FOR_YOUR_HARBOR_URL" # Harbor 地址
- REGISTRY_DIR = "kubernetes" # Harbor 的项目目录
- IMAGE_NAME = "spring-boot-project" # 镜像的名称
- NAMESPACE = "kubernetes" # 该应用在 Kubernetes 中的命名空间
- TAG = "" # 镜像的 Tag，在此用 BUILD_TAG+COMMIT_ID 组成
+stages {
+
+  stage('Pulling Code') {
+    parallel {
+       stage('Pulling Code by Jenkins') {
+         when {
+           expression {
+           # 假如 env.gitlabBranch 为空，则该流水线为手动触发，那么就会执行该stage，如果不为空则会执行同级的另外一个 stage
+             env.gitlabBranch == null
+           }
+         }
+         steps {
+           # 这里使用的是 git 插件拉取代码，BRANCH 变量取自于前面介绍的 parameters配置
+           # git@xxxxxx:root/spring-boot-project.git 代码地址
+           # credentialsId: 'gitlab-key'，之前创建的拉取代码的 key
+           git(changelog: true, poll: true, url: 'git@xxxxxx:root/springboot-project.git', branch: "${BRANCH}", credentialsId: 'gitlab-key')
+           script {  
+             # 定义一些变量用于生成镜像的 Tag
+             # 获取最近一次提交的 Commit ID
+             COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+             # 赋值给 TAG 变量，后面的 docker build 可以取到该 TAG 的值
+             TAG = BUILD_TAG + '-' + COMMIT_ID
+             println "Current branch is ${BRANCH}, Commit ID is ${COMMIT_ID}, Image TAG is ${TAG}"
+           }
+         }
+       }
+       stage('Pulling Code by trigger') {
+         when {
+           expression {
+           # 如果 env.gitlabBranch 不为空，说明该流水线是通过 webhook 触发，执行该 stage，上述的 stage 不再执行。此时 BRANCH 变量为空
+             env.gitlabBranch != null
+           }
+         }
+         steps {
+           # 以下配置和上述一致，只是此时 branch: env.gitlabBranch 取的值为env.gitlabBranch
+           git(url: 'git@xxxxxxxxxxx:root/spring-boot-project.git', branch: env.gitlabBranch, changelog: true, poll: true, credentialsId: 'gitlab-key')
+           script {
+             COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+             TAG = BUILD_TAG + '-' + COMMIT_ID
+             println "Current branch is ${env.gitlabBranch}, Commit ID is ${COMMIT_ID}, Image TAG is ${TAG}"
+           }
+         }
+       }
+     }
  }
- parameters {
-# 之前讲过一些 choice、input 类型的参数，本次使用的是 GitParameter 插件
-# 该字段会在 Jenkins 页面生成一个选择分支的选项
- gitParameter(branch: '', branchFilter: 'origin/(.*)', defaultValue: 
-'', description: 'Branch for build and deploy', name: 'BRANCH', 
-quickFilterEnabled: false, selectedValue: 'NONE', sortMode: 'NONE', 
-tagFilter: '*', type: 'PT_BRANCH')
- }
+
+
+
+  
+}
 接下来是拉代码的 stage，这个 stage 是一个并行的 stage，因为考虑了该流水线是手动触
 发还是触发：
-stage('Pulling Code') {
- parallel {
- stage('Pulling Code by Jenkins') {
- when {
- expression {
-# 假如 env.gitlabBranch 为空，则该流水线为手动触发，那么就会执行该
-stage，如果不为空则会执行同级的另外一个 stage
- env.gitlabBranch == null
- }
- }
- steps {
- # 这里使用的是 git 插件拉取代码，BRANCH 变量取自于前面介绍的 parameters
-配置
- # git@xxxxxx:root/spring-boot-project.git 代码地址
- # credentialsId: 'gitlab-key'，之前创建的拉取代码的 key
- git(changelog: true, poll: true, url: 'git@xxxxxx:root/springboot-project.git', branch: "${BRANCH}", credentialsId: 'gitlab-key')
- script {
-# 定义一些变量用于生成镜像的 Tag
-# 获取最近一次提交的 Commit ID
- COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --
-pretty=format:'%h'").trim()
-# 赋值给 TAG 变量，后面的 docker build 可以取到该 TAG 的值
- TAG = BUILD_TAG + '-' + COMMIT_ID
- println "Current branch is ${BRANCH}, Commit ID is 
-${COMMIT_ID}, Image TAG is ${TAG}"
- 
- }
- }
- }
- stage('Pulling Code by trigger') {
- when {
- expression {
-# 如果 env.gitlabBranch 不为空，说明该流水线是通过 webhook 触发，则此
-时执行该 stage，上述的 stage 不再执行。此时 BRANCH 变量为空
- env.gitlabBranch != null
- }
- }
- steps {
- # 以下配置和上述一致，只是此时 branch: env.gitlabBranch 取的值为
-env.gitlabBranch
- git(url: 'git@xxxxxxxxxxx:root/spring-boot-project.git', 
-branch: env.gitlabBranch, changelog: true, poll: true, credentialsId: 
-'gitlab-key')
- script {
- COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --
-pretty=format:'%h'").trim()
- TAG = BUILD_TAG + '-' + COMMIT_ID
- println "Current branch is ${env.gitlabBranch}, Commit ID is 
-${COMMIT_ID}, Image TAG is ${TAG}"
- }
- }
- }
- }
- }
+
 代码拉下来后，就可以执行构建命令，由于本次实验是 Java 示例，所以需要使用 mvn 命令
 进行构建：
 stage('Building') {
