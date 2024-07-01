@@ -105,7 +105,23 @@ spec:
     }
  }
 
-stages {
+  //设置全局环境变量
+  environment {
+    COMMIT_ID = ""
+    HARBOR_ADDRESS = "http://192.168.71.80/" # Harbor 地址
+    REGISTRY_DIR = "test" # Harbor 的项目目录
+    IMAGE_NAME = "spring-boot-project" # 镜像的名称
+    NAMESPACE = "study" # 该应用在 Kubernetes 中的命名空间
+    TAG = "" # 镜像的 Tag，在此用 BUILD_TAG+COMMIT_ID 组成
+  }
+ 
+  parameters {
+  # 之前讲过一些 choice、input 类型的参数，本次使用的是 GitParameter 插件
+  # 该字段会在 Jenkins 页面生成一个选择分支的选项
+    gitParameter(branch: '', branchFilter: 'origin/(.*)', defaultValue: '', description: 'Branch for build and deploy', name: 'BRANCH', quickFilterEnabled: false, selectedValue: 'NONE', sortMode: 'NONE', tagFilter: '*', type: 'PT_BRANCH')
+  }
+
+  stages {
 
   stage('Pulling Code') {
     parallel {
@@ -120,7 +136,7 @@ stages {
            # 这里使用的是 git 插件拉取代码，BRANCH 变量取自于前面介绍的 parameters配置
            # git@xxxxxx:root/spring-boot-project.git 代码地址
            # credentialsId: 'gitlab-key'，之前创建的拉取代码的 key
-           git(changelog: true, poll: true, url: 'git@xxxxxx:root/springboot-project.git', branch: "${BRANCH}", credentialsId: 'gitlab-key')
+           git(changelog: true, poll: true, url: 'git@192.168.71.79:devops/spring-boot-project.git', branch: "${BRANCH}", credentialsId: 'test1')
            script {  
              # 定义一些变量用于生成镜像的 Tag
              # 获取最近一次提交的 Commit ID
@@ -140,7 +156,7 @@ stages {
          }
          steps {
            # 以下配置和上述一致，只是此时 branch: env.gitlabBranch 取的值为env.gitlabBranch
-           git(url: 'git@xxxxxxxxxxx:root/spring-boot-project.git', branch: env.gitlabBranch, changelog: true, poll: true, credentialsId: 'gitlab-key')
+           git(url: 'git@192.168.71.79:devops/spring-boot-project.git', branch: env.gitlabBranch, changelog: true, poll: true, credentialsId: 'test1')
            script {
              COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
              TAG = BUILD_TAG + '-' + COMMIT_ID
@@ -149,72 +165,59 @@ stages {
          }
        }
      }
- }
-
-
-
-  
+     }
+  //镜像打包：
+  stage('Building') {
+    steps {
+    # 使用Pod里面的 build 容器进行构建
+      container(name: 'build') {
+        sh """ 
+        # 打包命令 需要根据自己项目的实际情况进行修改
+        mvn clean install -DskipTests
+        """
+      }
+    }
+  }
+  //生成编译产物后，需要根据该产物生成对应的镜像，此时可以使用 Pod 模板的 docker 容器：
+  stage('Docker build for creating image') {
+  # 首先取出来 HARBOR 的账号密码
+    environment {
+      HARBOR_USER = credentials('HARBOR_ACCOUNT')
+    }
+    steps {
+    # 指定使用 docker 容器
+      container(name: 'docker') {
+        sh """
+        # 执行 build 命令，Dockerfile 会在下一小节创建，也是放在代码仓库，和Jenkinsfile 同级
+          docker build -t ${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG} .
+        # 登录 Harbor，HARBOR_USER_USR 和 HARBOR_USER_PSW 由上述 environment 生成
+          docker login -u ${HARBOR_USER_USR} -p ${HARBOR_USER_PSW} ${HARBOR_ADDRESS}
+        # 将镜像推送至镜像仓库
+          docker push ${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG}
+        """
+      }
+    }
+  }
+  //最后一步就是将该镜像发版至 Kubernetes 集群中，此时使用的是包含 kubectl 命令的容器：
+  stage('Deploying to K8s') {
+  # 获取连接 Kubernetes 集群证书 
+    environment {
+      MY_KUBECONFIG = credentials('study-k8s-kubeconfig')
+    }
+    steps {
+    # 指定使用 kubectl 容器
+      container(name: 'kubectl'){
+        sh """
+        # 直接 set 更改 Deployment 的镜像即可
+          /usr/local/bin/kubectl --kubeconfig $MY_KUBECONFIG set image deploy -l app=${IMAGE_NAME} ${IMAGE_NAME}=${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG} -n $NAMESPACE
+        """
+      }
+    }
+  }
 }
-接下来是拉代码的 stage，这个 stage 是一个并行的 stage，因为考虑了该流水线是手动触
-发还是触发：
+}
 
-代码拉下来后，就可以执行构建命令，由于本次实验是 Java 示例，所以需要使用 mvn 命令
-进行构建：
-stage('Building') {
- steps {
- # 使用 Pod 模板里面的 build 容器进行构建
- container(name: 'build') {
- sh """ 
-# 编译命令， 需要根据自己项目的实际情况进行修改，可能会不一致
- mvn clean install -DskipTests
-# 构建完成后，一般情况下会在 target 目录下生成 jar 包
- ls target/*
- """
- }
- }
- }
-生成编译产物后，需要根据该产物生成对应的镜像，此时可以使用 Pod 模板的 docker 容器：
-stage('Docker build for creating image') {
- # 首先取出来 HARBOR 的账号密码
-environment {
- HARBOR_USER = credentials('HARBOR_ACCOUNT')
- }
- steps {
- # 指定使用 docker 容器
- container(name: 'docker') {
- sh """
- # 执行 build 命令，Dockerfile 会在下一小节创建，也是放在代码仓库，和
-Jenkinsfile 同级
- docker build -t 
-${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG} .
-# 登录 Harbor，HARBOR_USER_USR 和 HARBOR_USER_PSW 由上述 environment 生
-成
- docker login -u ${HARBOR_USER_USR} -p ${HARBOR_USER_PSW} 
-${HARBOR_ADDRESS}
-# 将镜像推送至镜像仓库
- docker push 
-${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG}
- """
- }
- }
- }
-最后一步就是将该镜像发版至 Kubernetes 集群中，此时使用的是包含 kubectl 命令的容器：
-stage('Deploying to K8s') {
- # 获取连接 Kubernetes 集群证书 
-environment {
- MY_KUBECONFIG = credentials('study-k8s-kubeconfig')
- }
- steps {
- # 指定使用 kubectl 容器
- container(name: 'kubectl'){
- sh """
- # 直接 set 更改 Deployment 的镜像即可
- /usr/local/bin/kubectl --kubeconfig $MY_KUBECONFIG set image 
-deploy -l app=${IMAGE_NAME} 
-${IMAGE_NAME}=${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG} -n 
-$NAMESPACE
- """
- }
- }
- }
- }
+
+
+
+
