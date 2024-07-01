@@ -122,101 +122,100 @@ spec:
   }
 
   stages {
-
-  stage('Pulling Code') {
-    parallel {
-       stage('Pulling Code by Jenkins') {
-         when {
-           expression {
+    
+    stage('Pulling Code') {
+      parallel {
+        stage('Pulling Code by Jenkins') {
+          when {
+            expression {
            # 假如 env.gitlabBranch 为空，则该流水线为手动触发，那么就会执行该stage，如果不为空则会执行同级的另外一个 stage
-             env.gitlabBranch == null
-           }
-         }
-         steps {
+              env.gitlabBranch == null
+            }
+          }
+          steps {
            # 这里使用的是 git 插件拉取代码，BRANCH 变量取自于前面介绍的 parameters配置
            # git@xxxxxx:root/spring-boot-project.git 代码地址
            # credentialsId: 'gitlab-key'，之前创建的拉取代码的 key
-           git(changelog: true, poll: true, url: 'git@192.168.71.79:devops/spring-boot-project.git', branch: "${BRANCH}", credentialsId: 'test1')
-           script {  
+            git(changelog: true, poll: true, url: 'git@192.168.71.79:devops/spring-boot-project.git', branch: "${BRANCH}", credentialsId: 'test1')
+            script {  
              # 定义一些变量用于生成镜像的 Tag
              # 获取最近一次提交的 Commit ID
-             COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+              COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
              # 赋值给 TAG 变量，后面的 docker build 可以取到该 TAG 的值
-             TAG = BUILD_TAG + '-' + COMMIT_ID
-             println "Current branch is ${BRANCH}, Commit ID is ${COMMIT_ID}, Image TAG is ${TAG}"
-           }
-         }
-       }
-       stage('Pulling Code by trigger') {
-         when {
-           expression {
+              TAG = BUILD_TAG + '-' + COMMIT_ID
+              println "Current branch is ${BRANCH}, Commit ID is ${COMMIT_ID}, Image TAG is ${TAG}"
+            }
+          }
+        }
+        stage('Pulling Code by trigger') {
+          when {
+            expression {
            # 如果 env.gitlabBranch 不为空，说明该流水线是通过 webhook 触发，执行该 stage，上述的 stage 不再执行。此时 BRANCH 变量为空
-             env.gitlabBranch != null
-           }
-         }
-         steps {
+              env.gitlabBranch != null
+            }
+          }
+          steps {
            # 以下配置和上述一致，只是此时 branch: env.gitlabBranch 取的值为env.gitlabBranch
-           git(url: 'git@192.168.71.79:devops/spring-boot-project.git', branch: env.gitlabBranch, changelog: true, poll: true, credentialsId: 'test1')
-           script {
-             COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
-             TAG = BUILD_TAG + '-' + COMMIT_ID
-             println "Current branch is ${env.gitlabBranch}, Commit ID is ${COMMIT_ID}, Image TAG is ${TAG}"
-           }
-         }
-       }
-     }
-     }
-  //镜像打包：
-  stage('Building') {
-    steps {
-    # 使用Pod里面的 build 容器进行构建
-      container(name: 'build') {
-        sh """ 
-        # 打包命令 需要根据自己项目的实际情况进行修改
-        mvn clean install -DskipTests
-        """
+            git(url: 'git@192.168.71.79:devops/spring-boot-project.git', branch: env.gitlabBranch, changelog: true, poll: true, credentialsId: 'test1')
+            script {
+              COMMIT_ID = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+              TAG = BUILD_TAG + '-' + COMMIT_ID
+              println "Current branch is ${env.gitlabBranch}, Commit ID is ${COMMIT_ID}, Image TAG is ${TAG}"
+            }
+          }
+        }
       }
     }
-  }
-  //生成编译产物后，需要根据该产物生成对应的镜像，此时可以使用 Pod 模板的 docker 容器：
-  stage('Docker build for creating image') {
-  # 首先取出来 HARBOR 的账号密码
-    environment {
-      HARBOR_USER = credentials('HARBOR_ACCOUNT')
+  //镜像打包：
+    stage('Building') {
+      steps {
+        # 使用Pod里面的 build 容器进行构建
+        container(name: 'build') {
+          sh """ 
+          # 打包命令 需要根据自己项目的实际情况进行修改
+          mvn clean install -DskipTests
+          """
+        }
+      }
     }
-    steps {
-    # 指定使用 docker 容器
-      container(name: 'docker') {
-        sh """
-        # 执行 build 命令，Dockerfile 会在下一小节创建，也是放在代码仓库，和Jenkinsfile 同级
+  //生成编译产物后，需要根据该产物生成对应的镜像，此时可以使用 Pod 模板的 docker 容器：
+    stage('Docker build for creating image') {
+      # 首先取出来 HARBOR 的账号密码
+      environment {
+        HARBOR_USER = credentials('HARBOR_ACCOUNT')
+      }
+      steps {
+        # 指定使用 docker 容器
+        container(name: 'docker') {
+          sh """
+          # 执行 build 命令，Dockerfile 会在下一小节创建，也是放在代码仓库，和Jenkinsfile 同级
           docker build -t ${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG} .
         # 登录 Harbor，HARBOR_USER_USR 和 HARBOR_USER_PSW 由上述 environment 生成
           docker login -u ${HARBOR_USER_USR} -p ${HARBOR_USER_PSW} ${HARBOR_ADDRESS}
         # 将镜像推送至镜像仓库
           docker push ${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG}
-        """
+          """
+        }
       }
     }
-  }
   //最后一步就是将该镜像发版至 Kubernetes 集群中，此时使用的是包含 kubectl 命令的容器：
-  stage('Deploying to K8s') {
-  # 获取连接 Kubernetes 集群证书 
-    environment {
-      MY_KUBECONFIG = credentials('study-k8s-kubeconfig')
-    }
-    steps {
-    # 指定使用 kubectl 容器
-      container(name: 'kubectl'){
-        sh """
-        # 直接 set 更改 Deployment 的镜像即可
+    stage('Deploying to K8s') {
+      # 获取连接 Kubernetes 集群证书 
+      environment {
+        MY_KUBECONFIG = credentials('study-k8s-kubeconfig')
+      }
+      steps {
+      # 指定使用 kubectl 容器
+        container(name: 'kubectl'){
+          sh """
+          # 直接 set 更改 Deployment 的镜像即可
           /usr/local/bin/kubectl --kubeconfig $MY_KUBECONFIG set image deploy -l app=${IMAGE_NAME} ${IMAGE_NAME}=${HARBOR_ADDRESS}/${REGISTRY_DIR}/${IMAGE_NAME}:${TAG} -n $NAMESPACE
-        """
+          """
+        }
       }
     }
   }
 }
-}
-
 
 
 
